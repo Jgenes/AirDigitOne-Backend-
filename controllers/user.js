@@ -5,7 +5,7 @@ const mail = require("../config/mail");
 const { v4: uuid } = require("uuid");
 
 
-// REGISTER
+// register route
 exports.register = async (req, res) => {
     try {
         const { fullname, email, phone, password } = req.body;
@@ -45,7 +45,7 @@ exports.register = async (req, res) => {
     }
 };
 
-// ACTIVATE ACCOUNT
+// activation account route
 exports.activate = async (req, res) => {
     try {
         const { token } = req.params;
@@ -61,7 +61,7 @@ exports.activate = async (req, res) => {
     }
 };
 
-// LOGIN
+// login route
 exports.login = async (req, res) => {
     try {
         const { emailOrPhone, password } = req.body;
@@ -98,7 +98,7 @@ exports.login = async (req, res) => {
     }
 };
 
-// VERIFY OTP
+// verify otp
 exports.verifyOtp = async (req, res) => {
     try {
         const { emailOrPhone, otp } = req.body;
@@ -160,22 +160,18 @@ exports.requestPasswordReset = async (req, res) => {
         if (userQuery.rowCount === 0) return res.status(404).json({ error: "User not found" });
 
         const user = userQuery.rows[0];
-
-        // Generate a reset token (JWT) valid for 15 minutes
         const resetToken = jwt.sign(
             { id: user.id },
             process.env.JWT_SECRET,
             { expiresIn: "15m" }
         );
 
-        // Save token in password_resets table
         const expires = new Date(Date.now() + 15*60*1000);
         await pool.query(
             "INSERT INTO password_resets (id, user_id, token, expires_at) VALUES ($1,$2,$3,$4)",
             [uuid(), user.id, resetToken, expires]
         );
 
-        // Send email with reset link
         await mail.sendMail({
             to: user.email,
             subject: "Password Reset Request",
@@ -190,37 +186,26 @@ exports.requestPasswordReset = async (req, res) => {
     }
 };
 
-// ------------------ RESET PASSWORD ------------------
+// password reset
 exports.resetPassword = async (req, res) => {
     try {
         const { token } = req.params;
         const { newPassword } = req.body;
         if (!newPassword) return res.status(400).json({ error: "New password is required" });
-
-        // Verify JWT token
         let decoded;
         try {
             decoded = jwt.verify(token, process.env.JWT_SECRET);
         } catch (err) {
             return res.status(400).json({ error: "Invalid or expired token" });
         }
-
-        // Check token in DB and not expired
         const resetQuery = await pool.query(
             "SELECT * FROM password_resets WHERE user_id=$1 AND token=$2 AND expires_at > NOW()",
             [decoded.id, token]
         );
         if (resetQuery.rowCount === 0) return res.status(400).json({ error: "Token expired or invalid" });
-
-        // Hash new password
         const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-        // Update user password
         await pool.query("UPDATE users SET password=$1 WHERE id=$2", [hashedPassword, decoded.id]);
-
-        // Delete used reset token
         await pool.query("DELETE FROM password_resets WHERE id=$1", [resetQuery.rows[0].id]);
-
         res.json({ message: "Password reset successfully" });
     } catch (err) {
         console.error(err);
