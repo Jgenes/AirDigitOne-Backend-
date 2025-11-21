@@ -3,11 +3,11 @@ const router = express.Router();
 const interestController = require("../controllers/interest");
 const { verifyToken, requireRole } = require("../middleware/auth");
 
-// All routes require authentication
+// all routes
 router.get("/", verifyToken, interestController.getCategories);
 router.post("/save", verifyToken, interestController.saveUserInterests);
 
-// Example admin route (add category)
+// route for admin to add category
 router.post("/admin/add-category", verifyToken, requireRole(["admin"]), async (req, res) => {
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: "Category name required" });
