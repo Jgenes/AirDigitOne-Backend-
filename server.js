@@ -1,12 +1,16 @@
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
 
-const express = require('express')
-const app = express()
-const port = 3000
+const userRoutes = require("./routes/user");
+const interestRoutes = require("./routes/interest");
 
-app.get('/', (req, res)=>{
-    res.send('AirDigOne')
-})
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-app.listen(port, () => {
-    console.log(`AirDigOne server started on port ${port}`)
-})
+app.use("/api/user", userRoutes);
+app.use("/api/interest", interestRoutes);
+
+app.listen(5000, () => console.log("Server running on port 5000"));
