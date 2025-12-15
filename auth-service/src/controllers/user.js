@@ -196,9 +196,9 @@ async function verifyOtp(req, res) {
     // Valid OTP → delete it
     await pool.query("DELETE FROM otps WHERE id=$1", [otpRecord.id]);
 
-    // Generate JWT token
+    // Generate JWT token with role
     const token = jwt.sign(
-      { id: user.id },
+      { id: user.id, role: user.role }, // <--- add role here
       process.env.JWT_SECRET,
       { expiresIn: "1d" }
     );
@@ -222,6 +222,7 @@ async function verifyOtp(req, res) {
     return res.status(500).json({ error: "Server error" });
   }
 }
+
 
 
 // ------------------ FORGOT PASSWORD ------------------
