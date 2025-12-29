@@ -1,6 +1,7 @@
 const express = require('express');
 require('dotenv').config();
 const employerRoutes = require('./routes/employer.routes');
+const jobRoutes = require('./routes/job.routes');
 const cors = require('cors');
 
 const app = express();
@@ -20,6 +21,8 @@ fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
 
 app.use('/api/v1/employer', employerRoutes);
+app.use("/api/v1/employer/jobs", jobRoutes);
+
 
 // removed problematic preflight registration:
 // app.options('/api/v1/employer/*', cors());

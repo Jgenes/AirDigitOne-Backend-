@@ -1,115 +1,200 @@
-const pool = require('../config/db');
-const { v4: uuidv4 } = require('uuid');
-const crypto = require('crypto');
+const express = require("express");
+const router = express.Router();
+const pool = require("../config/db");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const transporter = require("../config/mail");
+const { v4: uuid } = require("uuid");
 
-async function ensureEmployersTable() {
-    const sql = `
-    CREATE TABLE IF NOT EXISTS employers (
-      id UUID PRIMARY KEY,
-      company_name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      phone TEXT,
-      sector TEXT,
-      address TEXT,
-      password_hash TEXT,
-      password_salt TEXT,
-      status TEXT NOT NULL DEFAULT 'PENDING',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );`;
-    await pool.query(sql);
+// ------------------ HELPER: SEND EMAIL ------------------
+async function sendEmail(mailOptions) {
+  return new Promise((resolve, reject) => {
+    transporter.sendMail(mailOptions, (err, info) => {
+      if (err) return reject(err);
+      resolve(info);
+    });
+  });
 }
 
-async function ensureEmployerAuditsTable() {
-    const sql = `
-    CREATE TABLE IF NOT EXISTS employer_audits (
-      id UUID PRIMARY KEY,
-      employer_id UUID NOT NULL,
-      action TEXT NOT NULL,
-      admin_id UUID,
-      reason TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );`;
-    await pool.query(sql);
-}
+// ------------------ REGISTER EMPLOYER ------------------
+async function registerEmployer(req, res) {
+  try {
+    const { fullname, company_name, owner_name, email, phone, password, address, sector } = req.body;
 
-async function ensureTables() {
-    await ensureEmployersTable();
-    await ensureEmployerAuditsTable();
-}
-
-// Register employer endpoint
-exports.registerEmployer = async (req, res) => {
-    const { company_name, email, phone, sector, address, password } = req.body;
-    if (!company_name || !email || !password) {
-        return res.status(400).json({ error: 'company_name, email and password are required' });
+    if (!fullname || !email || !password || !company_name || !owner_name) {
+      return res.status(400).json({ error: "Fullname, company_name, owner_name, email, and password are required" });
     }
 
-    try {
-        await ensureTables();
+    const exist = await pool.query("SELECT * FROM users WHERE email=$1 OR phone=$2", [email, phone]);
+    if (exist.rowCount > 0) return res.status(400).json({ error: "Email or phone already exists" });
 
-        // check duplicate email
-        const dup = await pool.query('SELECT id FROM employers WHERE email=$1', [email.toLowerCase()]);
-        if (dup.rowCount > 0) return res.status(409).json({ error: 'Email already registered' });
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-        // hash password (scrypt)
-        const salt = crypto.randomBytes(16).toString('hex');
-        const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+    const newEmployer = await pool.query(
+      `INSERT INTO users 
+        (id, fullname, company_name, owner_name, email, phone, password, role, address, sector)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [uuid(), fullname, company_name, owner_name, email, phone || null, hashedPassword, "employer", address || null, sector || null]
+    );
 
-        const id = uuidv4();
-        const insertSql = `
-            INSERT INTO employers (id, company_name, email, phone, sector, address, password_hash, password_salt, status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            RETURNING id, company_name, email, status, created_at`;
-        const values = [id, company_name, email.toLowerCase(), phone || null, sector || null, address || null, hash, salt, 'PENDING'];
-        const r = await pool.query(insertSql, values);
+    const token = jwt.sign({ id: newEmployer.rows[0].id, role: "employer" }, process.env.JWT_SECRET, { expiresIn: "1d" });
 
-        return res.status(201).json({ message: 'Employer registered', employer: r.rows[0] });
-    } catch (err) {
-        console.error('Employer registration error:', err);
-        return res.status(500).json({ error: 'Server error' });
-    }
-};
+    const mailOptions = {
+      from: `"AirDigital One" <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject: "Activate Your Employer Account",
+      html: `
+        <p>Hello ${fullname},</p>
+        <p>Welcome to AirDigital One! Please activate your employer account by clicking the link below:</p>
+        <p><a href="http://localhost:5000/api/v1/user/activate/${token}">Activate Account</a></p>
+        <p>If the button does not work, copy and paste the following link into your browser:</p>
+        <p>http://localhost:5000/api/v1/user/activate/${token}</p>
+      `
+    };
 
-// Get employer info
-exports.getEmployer = async (req, res) => {
+    await sendEmail(mailOptions);
+
+    res.json({ message: "Employer registered. Check email to activate account.", user: newEmployer.rows[0] });
+
+  } catch (err) {
+    console.error("Register Employer Error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+}
+
+// ------------------ ACTIVATE USER ------------------
+async function activate(req, res) {
+  try {
+    const { token } = req.params;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    const updated = await pool.query("UPDATE users SET is_verified=true WHERE id=$1 RETURNING *", [decoded.id]);
+    if (!updated.rows[0]) return res.status(404).send("User not found");
+
+    const mailOptions = {
+      from: `"AirDigital One" <${process.env.EMAIL_USER}>`,
+      to: updated.rows[0].email,
+      subject: "Your Account is Activated!",
+      html: `
+        <h2>Welcome, ${updated.rows[0].fullname}!</h2>
+        <p>Your account has been successfully activated.</p>
+        <p>You can now log in and start using our services.</p>
+      `
+    };
+
+    await sendEmail(mailOptions);
+    res.redirect(`http://localhost:3000/interest?userId=${decoded.id}`);
+
+  } catch (err) {
+    console.error("Activation Error:", err);
+    res.status(400).send("Invalid or expired activation link");
+  }
+}
+
+// ------------------ LOGIN (OTP) ------------------
+async function login(req, res) {
+  try {
+    const { emailOrPhone, password } = req.body;
+    if (!emailOrPhone || !password) return res.status(400).json({ error: "Email/phone and password are required" });
+
+    const userQuery = await pool.query("SELECT * FROM users WHERE LOWER(email)=LOWER($1) OR phone=$1", [emailOrPhone.trim()]);
+    if (userQuery.rowCount === 0) return res.status(404).json({ error: "User not found" });
+
+    const user = userQuery.rows[0];
+    const validPass = await bcrypt.compare(password, user.password);
+    if (!validPass) return res.status(400).json({ error: "Invalid password" });
+    if (!user.is_verified) return res.status(403).json({ error: "Account not activated" });
+
+    await pool.query("DELETE FROM otps WHERE user_id=$1", [user.id]);
+
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const expires = new Date(Date.now() + 5 * 60 * 1000);
+
+    await pool.query("INSERT INTO otps (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)", [uuid(), user.id, otpCode, expires]);
+
+    const mailOptions = {
+      from: `"AirDigital One" <${process.env.EMAIL_USER}>`,
+      to: user.email,
+      subject: "Your Login OTP",
+      text: `Your OTP is ${otpCode}. It will expire in 5 minutes.`
+    };
+
+    await sendEmail(mailOptions);
+    res.json({ message: "OTP sent to email" });
+
+  } catch (err) {
+    console.error("Login Error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+}
+
+// ------------------ GET ALL EMPLOYERS ------------------
+async function getAllEmployers(req, res) {
+  try {
+    const result = await pool.query(`
+      SELECT id, company_name, registration_number, tax_id, sector,
+             number_of_employees, contact_person, contact_email, contact_phone, is_verified
+      FROM employer_details
+      ORDER BY company_name
+    `);
+    res.json(result.rows);
+
+  } catch (err) {
+    console.error("Get All Employers Error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+}
+
+// ------------------ GET EMPLOYER DETAILS ------------------
+async function getEmployerDetails(req, res) {
+  try {
     const { id } = req.params;
-    try {
-        // use actual column names and alias company_name -> company
-        const q = `SELECT id, company_name AS company, email, status, created_at, updated_at FROM employers WHERE id=$1`;
-        const r = await pool.query(q, [id]);
-        if (r.rowCount === 0) return res.status(404).json({ error: 'Employer not found' });
-        return res.json({ employer: r.rows[0] });
-    } catch (err) {
-        console.error('Error fetching employer:', err);
-        return res.status(500).json({ error: 'Server error' });
-    }
-};
+    const result = await pool.query(`
+      SELECT id, company_name, registration_number, tax_id, sector,
+             number_of_employees, physical_address, postal_address, website,
+             contact_person, contact_email, contact_phone, company_description,
+             operational_areas, business_license_path, tax_certificate_path, logo_path,
+             is_verified
+      FROM employer_details
+      WHERE id=$1
+    `, [id]);
 
-// Approve/reject/suspend employer (admin action)
-exports.adminUpdateEmployerStatus = async (req, res) => {
-    const { employerId } = req.params;
-    const { action, adminId, reason } = req.body; // action: VERIFY/REJECT/SUSPEND
-    if (!action) return res.status(400).json({ error: 'Action is required' });
+    if (result.rowCount === 0) return res.status(404).json({ error: "Employer not found" });
+    res.json(result.rows[0]);
 
-    const allowed = { VERIFY: 'VERIFIED', REJECT: 'REJECTED', SUSPEND: 'SUSPENDED' };
-    if (!allowed[action]) return res.status(400).json({ error: 'Invalid action' });
+  } catch (err) {
+    console.error("Get Employer Details Error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+}
 
-    try {
-        await ensureTables();
-        const status = allowed[action];
-        await pool.query(`UPDATE employers SET status=$1, updated_at=NOW() WHERE id=$2`, [status, employerId]);
+// ------------------ ACTIVATE EMPLOYER ------------------
+async function activateEmployer(req, res) {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(`
+      UPDATE employer_details
+      SET is_verified=true
+      WHERE id=$1
+      RETURNING *
+    `, [id]);
 
-        // insert audit
-        const auditId = uuidv4();
-        await pool.query(
-          `INSERT INTO employer_audits (id, employer_id, action, admin_id, reason) VALUES ($1,$2,$3,$4,$5)`,
-          [auditId, employerId, action, adminId || null, reason || null]
-        );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Employer not found" });
+    res.json({ message: "Employer activated successfully", employer: result.rows[0] });
 
-        return res.json({ message: 'Employer status updated', status });
-    } catch (err) {
-        console.error('Error updating employer status:', err);
-        return res.status(500).json({ error: 'Server error' });
-    }
+  } catch (err) {
+    console.error("Activate Employer Error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+}
+
+module.exports = {
+  login,
+  registerEmployer,
+  activate,
+  sendEmail,
+  getAllEmployers,
+  getEmployerDetails,
+  activateEmployer
 };

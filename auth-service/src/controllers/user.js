@@ -109,33 +109,50 @@ async function activate(req, res) {
 }
 
 // ------------------ LOGIN (OTP) ------------------
+
 async function login(req, res) {
   try {
-    const { emailOrPhone, password } = req.body;
-    if (!emailOrPhone || !password)
-      return res.status(400).json({ error: "Email/phone and password are required" });
+    // Destructure email/phone and password from the request body
+    const { email, phone, password } = req.body;
 
-    const userQuery = await pool.query(
-      "SELECT * FROM users WHERE LOWER(email)=LOWER($1) OR phone=$1",
-      [emailOrPhone.trim()]
-    );
-    if (userQuery.rowCount === 0) return res.status(404).json({ error: "User not found" });
+    // Validate that email/phone and password are provided
+    if (!(email || phone) || !password) {
+      return res.status(400).json({ error: "Email/phone and password are required" });
+    }
+
+    let userQuery;
+
+    // Check if email or phone is provided, then query accordingly
+    if (email) {
+      userQuery = await pool.query("SELECT * FROM users WHERE LOWER(email) = LOWER($1)", [email.trim()]);
+    } else if (phone) {
+      userQuery = await pool.query("SELECT * FROM users WHERE phone = $1", [phone.trim()]);
+    }
+
+    if (userQuery.rowCount === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
 
     const user = userQuery.rows[0];
+
+    // Check if the password is valid
     const validPass = await bcrypt.compare(password, user.password);
-    if (!validPass) return res.status(400).json({ error: "Invalid password" });
-    if (!user.is_verified) return res.status(403).json({ error: "Account not activated" });
+    if (!validPass) {
+      return res.status(400).json({ error: "Invalid password" });
+    }
 
-    await pool.query("DELETE FROM otps WHERE user_id=$1", [user.id]);
+    // Check if the user's account is activated
+    if (!user.is_verified) {
+      return res.status(403).json({ error: "Account not activated" });
+    }
 
+    // Generate OTP and insert into database
     const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
     const expires = new Date(Date.now() + 5 * 60 * 1000);
 
-    await pool.query(
-      "INSERT INTO otps (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)",
-      [uuid(), user.id, otpCode, expires]
-    );
+    await pool.query("INSERT INTO otps (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)", [uuid(), user.id, otpCode, expires]);
 
+    // Send OTP to the user via email
     const mailOptions = {
       from: `"AirDigital One" <${process.env.EMAIL_USER}>`,
       to: user.email,
@@ -145,12 +162,16 @@ async function login(req, res) {
 
     await sendEmail(mailOptions);
 
-    res.json({ message: "OTP sent to email" });
+    // Respond with success and return role and user data
+    return res.json({ message: "OTP sent to email", role: user.role, userId: user.id });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
+    console.error("Login error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 }
+
+
+
 
 // ------------------ VERIFY OTP ------------------
 async function verifyOtp(req, res) {
@@ -183,38 +204,48 @@ async function verifyOtp(req, res) {
 
     const otpRecord = otpQuery.rows[0];
 
-    // Check expiration
     if (new Date() > otpRecord.expires_at) {
       return res.status(400).json({ error: "OTP expired" });
     }
 
-    // Check code
     if (otp.toString().trim() !== otpRecord.code.toString().trim()) {
       return res.status(400).json({ error: "Invalid OTP" });
     }
 
-    // Valid OTP → delete it
+    // delete used OTP
     await pool.query("DELETE FROM otps WHERE id=$1", [otpRecord.id]);
 
-    // Generate JWT token with role
+    // Generate JWT token
     const token = jwt.sign(
-      { id: user.id, role: user.role }, // <--- add role here
+      { id: user.id, role: user.role },
       process.env.JWT_SECRET,
       { expiresIn: "1d" }
     );
 
-    // Check for existing interests
-    const interestCheck = await pool.query(
-      "SELECT * FROM user_interests WHERE user_id=$1",
-      [user.id]
-    );
+    let redirectTo = "/dashboard"; // default
 
-    const hasInterest = interestCheck.rowCount > 0;
+    // ===== Role-based redirection =====
+    if (user.role === "admin") {
+      redirectTo = "/admin/dashboard"; // admin redirect
+    } else if (user.role === "employer") {
+      const empQuery = await pool.query(
+        "SELECT * FROM employer_details WHERE employer_id=$1",
+        [user.id]
+      );
+
+      if (empQuery.rowCount === 0) {
+        redirectTo = "/employer/onboarding"; // details not uploaded
+      } else if (!empQuery.rows[0].is_verified) {
+        redirectTo = "/employer/wait-verification"; // uploaded but not verified
+      } else {
+        redirectTo = "/employer/dashboard"; // verified
+      }
+    }
 
     return res.json({
       message: "OTP verified successfully",
       token,
-      hasInterest,
+      redirectTo
     });
 
   } catch (err) {
@@ -222,6 +253,7 @@ async function verifyOtp(req, res) {
     return res.status(500).json({ error: "Server error" });
   }
 }
+
 
 
 
